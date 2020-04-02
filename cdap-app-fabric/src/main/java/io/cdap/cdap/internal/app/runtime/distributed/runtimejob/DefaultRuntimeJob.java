@@ -74,6 +74,7 @@ import io.cdap.cdap.internal.app.runtime.distributed.DistributedWorkflowProgramR
 import io.cdap.cdap.internal.app.runtime.monitor.RuntimeClientService;
 import io.cdap.cdap.internal.app.runtime.monitor.ServiceSocksProxyInfo;
 import io.cdap.cdap.internal.app.runtime.monitor.TrafficRelayServer;
+import io.cdap.cdap.internal.profile.ProfileMetricService;
 import io.cdap.cdap.logging.appender.LogAppenderInitializer;
 import io.cdap.cdap.logging.appender.loader.LogAppenderLoaderService;
 import io.cdap.cdap.logging.context.LoggingContextHelper;
@@ -83,8 +84,10 @@ import io.cdap.cdap.messaging.guice.MessagingServerRuntimeModule;
 import io.cdap.cdap.messaging.server.MessagingHttpService;
 import io.cdap.cdap.metrics.guice.MetricsClientRuntimeModule;
 import io.cdap.cdap.proto.ProgramType;
+import io.cdap.cdap.proto.id.ProfileId;
 import io.cdap.cdap.proto.id.ProgramId;
 import io.cdap.cdap.proto.id.ProgramRunId;
+import io.cdap.cdap.runtime.spi.provisioner.Cluster;
 import io.cdap.cdap.runtime.spi.runtimejob.RuntimeJob;
 import io.cdap.cdap.runtime.spi.runtimejob.RuntimeJobEnvironment;
 import io.cdap.cdap.security.auth.context.AuthenticationContextModules;
@@ -104,6 +107,7 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.Reader;
+import java.net.Authenticator;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ProxySelector;
@@ -143,16 +147,18 @@ public class DefaultRuntimeJob implements RuntimeJob {
     SLF4JBridgeHandler.install();
 
     // Get Program Options
-    ProgramOptions programOptions = readJsonFile(new File(DistributedProgramRunner.PROGRAM_OPTIONS_FILE_NAME),
+    ProgramOptions programOpts = readJsonFile(new File(DistributedProgramRunner.PROGRAM_OPTIONS_FILE_NAME),
                                                  ProgramOptions.class);
-    ProgramRunId programRunId = programOptions.getProgramId().run(ProgramRunners.getRunId(programOptions));
+    ProgramRunId programRunId = programOpts.getProgramId().run(ProgramRunners.getRunId(programOpts));
     ProgramId programId = programRunId.getParent();
 
+    Arguments systemArgs = programOpts.getArguments();
+
     // Setup logging context for the program
-    Arguments systemArgs = programOptions.getArguments();
     LoggingContextAccessor.setLoggingContext(LoggingContextHelper.getLoggingContextWithRunId(programRunId,
                                                                                              systemArgs.asMap()));
-
+    // Get the cluster launch type
+    Cluster cluster = GSON.fromJson(systemArgs.getOption(ProgramOptionConstants.CLUSTER), Cluster.class);
 
     // Get App spec
     ApplicationSpecification appSpec = readJsonFile(new File(DistributedProgramRunner.APP_SPEC_FILE_NAME),
@@ -161,23 +167,26 @@ public class DefaultRuntimeJob implements RuntimeJob {
 
     // Create injector and get program runner
     Injector injector = Guice.createInjector(createModules(runtimeJobEnv, createCConf(runtimeJobEnv), programRunId));
+    CConfiguration cConf = injector.getInstance(CConfiguration.class);
 
     LogAppenderInitializer logAppenderInitializer = injector.getInstance(LogAppenderInitializer.class);
-    Deque<Service> coreServices = createCoreServices(injector);
+    Deque<Service> coreServices = createCoreServices(injector, systemArgs, cluster);
 
     ProxySelector oldProxySelector = ProxySelector.getDefault();
-    ProxySelector.setDefault(injector.getInstance(ProxySelector.class));
+    if (cConf.get(Constants.RuntimeMonitor.MONITOR_URL) == null) {
+      Authenticator.setDefault(injector.getInstance(Authenticator.class));
+      ProxySelector.setDefault(injector.getInstance(ProxySelector.class));
+    }
     startCoreServices(coreServices, logAppenderInitializer);
 
     try {
-      SystemArguments.setLogLevel(programOptions.getUserArguments(), logAppenderInitializer);
-      CConfiguration cConf = injector.getInstance(CConfiguration.class);
+      SystemArguments.setLogLevel(programOpts.getUserArguments(), logAppenderInitializer);
       ProgramRunner programRunner = injector.getInstance(ProgramRunnerFactory.class).create(programId.getType());
 
       // Create and run the program. The program files should be present in current working directory.
-      try (Program program = createProgram(cConf, programRunner, programDescriptor, programOptions)) {
+      try (Program program = createProgram(cConf, programRunner, programDescriptor, programOpts)) {
         CompletableFuture<ProgramController.State> programCompletion = new CompletableFuture<>();
-        ProgramController controller = programRunner.run(program, programOptions);
+        ProgramController controller = programRunner.run(program, programOpts);
         controllerFuture.complete(controller);
 
         controller.addListener(new AbstractListener() {
@@ -210,21 +219,7 @@ public class DefaultRuntimeJob implements RuntimeJob {
     } finally {
       stopCoreServices(coreServices, logAppenderInitializer);
       ProxySelector.setDefault(oldProxySelector);
-    }
-  }
-
-  /**
-   * Stops the running program before it completes. It is supposed to be called when user request to stop a run.
-   */
-  private void stop() {
-    try {
-      ProgramController controller = controllerFuture.getNow(null);
-      if (controller == null) {
-        throw new IllegalStateException("Program hasn't been started");
-      }
-      controller.stop();
-    } catch (Exception e) {
-      LOG.warn("Cannot stop a failed program", e);
+      Authenticator.setDefault(null);
     }
   }
 
@@ -331,13 +326,13 @@ public class DefaultRuntimeJob implements RuntimeJob {
   }
 
   @VisibleForTesting
-  Deque<Service> createCoreServices(Injector injector) {
+  Deque<Service> createCoreServices(Injector injector, Arguments systemArgs, Cluster cluster) {
     Deque<Service> services = new LinkedList<>();
+
+    services.add(injector.getInstance(LogAppenderLoaderService.class));
 
     MetricsCollectionService metricsCollectionService = injector.getInstance(MetricsCollectionService.class);
     services.add(metricsCollectionService);
-
-    services.add(injector.getInstance(LogAppenderLoaderService.class));
 
     MessagingService messagingService = injector.getInstance(MessagingService.class);
     if (messagingService instanceof Service) {
@@ -345,10 +340,18 @@ public class DefaultRuntimeJob implements RuntimeJob {
     }
     services.add(injector.getInstance(MessagingHttpService.class));
 
-    // Bind the traffic relay on the host, not on the loopback interface. It needs to be accessible from all workers.
-    services.add(injector.getInstance(TrafficRelayService.class));
+    // Starts the traffic relay if monitoring is done through SSH tunnel
+    if (injector.getInstance(CConfiguration.class).get(Constants.RuntimeMonitor.MONITOR_URL) == null) {
+      services.add(injector.getInstance(TrafficRelayService.class));
+    }
     services.add(injector.getInstance(RuntimeClientService.class));
 
+    // Creates a service to emit profile metrics
+    ProgramRunId programRunId = injector.getInstance(ProgramRunId.class);
+    ProfileId profileId = SystemArguments.getProfileIdFromArgs(programRunId.getNamespaceId(), systemArgs.asMap())
+      .orElseThrow(() -> new IllegalStateException("Missing profile information for program run " + programRunId));
+    services.add(new ProfileMetricService(metricsCollectionService, programRunId, profileId,
+                                          cluster.getNodes().size()));
     return services;
   }
 
@@ -369,6 +372,9 @@ public class DefaultRuntimeJob implements RuntimeJob {
   }
 
   private void stopCoreServices(Deque<Service> coreServices, LogAppenderInitializer logAppenderInitializer) {
+    // Close the log appender first to make sure all important logs are published.
+    logAppenderInitializer.close();
+
     // Stop all services. Reverse the order.
     for (Service service : (Iterable<Service>) coreServices::descendingIterator) {
       LOG.debug("Stopping core service {}", service);
@@ -378,7 +384,6 @@ public class DefaultRuntimeJob implements RuntimeJob {
         LOG.warn("Exception raised when stopping service {} during program termination.", service, e);
       }
     }
-    logAppenderInitializer.close();
   }
 
   /**

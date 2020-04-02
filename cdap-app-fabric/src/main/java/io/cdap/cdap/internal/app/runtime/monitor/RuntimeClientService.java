@@ -69,6 +69,8 @@ public class RuntimeClientService extends AbstractRetryableScheduledService {
   private static final Logger LOG = LoggerFactory.getLogger(RuntimeClientService.class);
   private static final Logger PROGRESS_LOG = Loggers.sampling(LOG,
                                                               LogSamplers.limitRate(TimeUnit.SECONDS.toMillis(30)));
+  private static final Logger OUTAGE_LOG = Loggers.sampling(LOG,
+                                                            LogSamplers.limitRate(TimeUnit.SECONDS.toMillis(30)));
   private static final Gson GSON = new Gson();
 
   private final Map<String, TopicRelayer> topicRelayers;
@@ -123,7 +125,7 @@ public class RuntimeClientService extends AbstractRetryableScheduledService {
 
   @Override
   protected boolean shouldRetry(Exception e) {
-    LOG.warn("Failed to send runtime status. Will be retried.", e);
+    OUTAGE_LOG.warn("Failed to send runtime status. Will be retried.", e);
     return true;
   }
 
@@ -230,7 +232,14 @@ public class RuntimeClientService extends AbstractRetryableScheduledService {
 
     @Override
     public void close() throws IOException {
-      // no-op
+      try {
+        // Force one extra poll
+        publishMessages();
+      } catch (TopicNotFoundException | BadRequestException e) {
+        // This shouldn't happen. If it does, it must be some bug in the system and there is no way to recover from it.
+        // So just log the cause for debugging.
+        LOG.error("Failed to publish messages on close for topic {}", topicId, e);
+      }
     }
   }
 
@@ -274,6 +283,7 @@ public class RuntimeClientService extends AbstractRetryableScheduledService {
 
     @Override
     public void close() throws IOException {
+      super.close();
       if (!lastProgramStateMessages.isEmpty()) {
         try {
           super.processMessages(lastProgramStateMessages.iterator());

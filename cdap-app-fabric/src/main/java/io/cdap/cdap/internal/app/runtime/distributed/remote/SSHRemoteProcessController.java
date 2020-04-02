@@ -89,17 +89,29 @@ final class SSHRemoteProcessController implements RemoteProcessController {
   }
 
   @Override
+  public void terminate() throws Exception {
+    // SIGTERM
+    killProcess(15);
+  }
+
+  @Override
   public void kill() throws Exception {
+    // SIGKILL
+    killProcess(9);
+  }
+
+  private void killProcess(int signal) throws IOException, InterruptedException {
     // SSH and kill the process
     try (SSHSession session = new DefaultSSHSession(sshConfig)) {
-      SSHProcess process = session.execute("pkill -9 -f -- -Dcdap.runid=" + programRunId.getRun());
+      SSHProcess process = session.execute(String.format("pkill -%d -f -- -Dcdap.runid=%s",
+                                                         signal, programRunId.getRun()));
 
       // Reading will be blocked until the process finished
       ByteStreams.toByteArray(process.getInputStream());
       String err = CharStreams.toString(new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8));
 
       int exitCode = process.waitFor();
-      // If the exit code is 1, it means there is no such process, which is fine from the killing perspective
+      // If the exit code is 1, it means there is no such process, which is fine from the termination perspective
       if (exitCode == 0 || exitCode == 1) {
         return;
       }
