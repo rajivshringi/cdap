@@ -35,9 +35,7 @@ import io.cdap.cdap.store.StoreDefinition;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 /**
@@ -135,23 +133,13 @@ public class ProgramHeartbeatTable {
     try (CloseableIterator<StructuredRow> iterator =
       table.scan(Range.create(startRowKey, Range.Bound.INCLUSIVE, endRowKey, Range.Bound.EXCLUSIVE),
                  Integer.MAX_VALUE)) {
-      Map<ProgramRunId, RunRecordDetail> runIdToRunRecordMap = new HashMap<>();
       while (iterator.hasNext()) {
         StructuredRow row = iterator.next();
-        RunRecordDetail runRecordMeta = GSON.fromJson(row.getString(StoreDefinition.ProgramHeartbeatStore.RUN_RECORD),
+        RunRecordDetail existing = GSON.fromJson(row.getString(StoreDefinition.ProgramHeartbeatStore.RUN_RECORD),
                                                       RunRecordDetail.class);
         ProgramRunId runId = getProgramRunIdFromRow(row);
-        runIdToRunRecordMap.put(runId, runRecordMeta);
+        runRecordMetas.add(RunRecordDetail.builder(existing).setProgramRunId(runId).build());
       }
-
-      // since the serialized runRecordMeta doesn't have programRunId (transient), we will create and
-      // add the programRunId to RunRecordDetail and add to result list
-
-      runIdToRunRecordMap.entrySet().forEach((entry) -> {
-        RunRecordDetail.Builder builder = RunRecordDetail.builder(entry.getValue());
-        builder.setProgramRunId(entry.getKey());
-        runRecordMetas.add(builder.build());
-      });
     }
   }
 
