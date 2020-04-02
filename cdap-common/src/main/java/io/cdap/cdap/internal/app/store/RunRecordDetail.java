@@ -91,6 +91,7 @@ public final class RunRecordDetail extends RunRecord {
   }
 
   public Map<String, String> getUserArgs() {
+    Map<String, String> userArgs = this.userArgs;
     if (userArgs != null) {
       return userArgs;
     }
@@ -99,8 +100,9 @@ public final class RunRecordDetail extends RunRecord {
       userArgs = new LinkedHashMap<>(new Gson().fromJson(properties.get("runtimeArgs"),
                                                          new TypeToken<Map<String, String>>() { }.getType()));
     } else {
-      this.userArgs = Collections.emptyMap();
+      userArgs = Collections.emptyMap();
     }
+    this.userArgs = userArgs;
     return userArgs;
   }
 
